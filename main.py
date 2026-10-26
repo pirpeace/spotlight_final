@@ -16,6 +16,9 @@ Spotlight for Teaching — Image Processing Project
     (ทดสอบหลักการก่อน: python live_mac.py --check)
 """
 
+import sys
+sys.dont_write_bytecode = True   # ไม่สร้าง __pycache__ (ต้องอยู่ก่อน import ไฟล์ในโปรเจค)
+
 import argparse
 import time
 
