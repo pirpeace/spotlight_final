@@ -10,7 +10,12 @@ live_mac.py
      -> ภาพที่จับได้จึงไม่มีหน้าต่าง Spotlight ปนเข้ามาเลย ภาพซ้อนเกิดไม่ได้
   3) ส่งภาพเข้า SpotlightRenderer เดิม แล้ววาดผลลัพธ์กลับเป็นหน้าต่างในข้อ 1
   4) ตำแหน่งเมาส์ใช้ NSEvent.mouseLocation() (ไม่ต้องขอสิทธิ์เพิ่ม)
-     ปุ่มลัดใช้ global key monitor (ต้องเปิดสิทธิ์ Input Monitoring ให้ Terminal/IDE)
+  5) ปุ่มลัดใช้ CGEventTap (แบบ active) รันใน thread แยก
+     -> กดปุ่มลัดแล้วโปรแกรมทำงานทันที และ "กลืน" ปุ่มนั้นไว้ ไม่ส่งต่อไปยังแอปที่โฟกัสอยู่
+        (เหมือนโหมด snapshot ที่ปุ่มไปถึงหน้าต่าง OpenCV อย่างเดียว)
+     -> ปุ่มอื่นที่ไม่ใช่ปุ่มลัด (ลูกศร, Space, Page Up/Down) และปุ่มที่กดพร้อม Cmd/Ctrl/Option
+        ส่งต่อให้สไลด์ตามปกติ
+     -> ต้องเปิดสิทธิ์ Accessibility ให้ Terminal/IDE
 
 ติดตั้ง:  pip install pyobjc-framework-Quartz pyobjc-framework-Cocoa
 ทดสอบหลักการก่อนใช้จริง:  python live_mac.py --check
@@ -18,6 +23,7 @@ live_mac.py
 
 import sys
 import time
+import threading
 import collections
 
 import cv2
@@ -29,13 +35,15 @@ if sys.platform != "darwin":
 import objc
 import Quartz
 from AppKit import NSApplication, NSColor, NSEvent, NSScreen, NSWindow
-from Foundation import NSData, NSDate, NSRunLoop
+from Foundation import NSData, NSDate, NSDefaultRunLoopMode
+from CoreFoundation import (CFMachPortCreateRunLoopSource, CFRunLoopAddSource,
+                            CFRunLoopGetCurrent, CFRunLoopRun, CFRunLoopStop,
+                            kCFRunLoopCommonModes)
 
 # ค่าคงที่ของ AppKit (ใส่เป็นตัวเลขตรง ๆ กันชื่อ constant ต่างกันตามเวอร์ชัน PyObjC)
 _STYLE_BORDERLESS = 0
 _BACKING_BUFFERED = 2
 _POLICY_ACCESSORY = 1                 # ไม่มีไอคอนบน Dock
-_EVENT_MASK_KEYDOWN = 1 << 10
 _JOIN_ALL_SPACES = 1 << 0
 _STATIONARY = 1 << 4
 _IGNORES_CYCLE = 1 << 6
@@ -45,6 +53,16 @@ _FULLSCREEN_AUXILIARY = 1 << 8        # ให้ลอยเหนือแอ�
 _BITMAP_BGRX = int(Quartz.kCGBitmapByteOrder32Little) | int(Quartz.kCGImageAlphaNoneSkipFirst)
 
 KEY_ESC = 53
+_EVENT_MASK_ANY = 0xFFFFFFFFFFFFFFFF
+
+# รหัสปุ่มจริงบนคีย์บอร์ด -> ตัวอักษร (ใช้ได้แม้คีย์บอร์ดเป็นภาษาไทย)
+KEYCODE_TO_CHAR = {
+    12: "q", 31: "o", 4: "h", 1: "s",
+    18: "1", 19: "2", 20: "3",
+    24: "=", 27: "-", 33: "[", 30: "]",
+    43: ",", 47: ".", 41: ";", 39: "'",
+    40: "k", 37: "l", 11: "b", 14: "e", 15: "r",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -81,9 +99,16 @@ class LiveOverlay:
         self.show_window()
         self.win_id = int(win.windowNumber())
 
-        self._keys = collections.deque()
-        self._monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-            _EVENT_MASK_KEYDOWN, self._on_key)
+        # ---- ปุ่มลัด : CGEventTap ใน thread แยก ----
+        self._keys = collections.deque()          # deque ปลอดภัยเมื่อใช้ข้าม thread
+        self._tap = None
+        self._tap_loop = None
+        self._tap_ready = threading.Event()
+        self._tap_cb = self._on_tap               # เก็บ reference กัน callback ถูก GC
+        self._tap_thread = threading.Thread(target=self._run_tap, daemon=True)
+        self._tap_thread.start()
+        self._tap_ready.wait(2.0)
+        self.keys_ok = self._tap is not None
 
     # ---- หน้าต่าง ----
     def show_window(self):
@@ -95,24 +120,80 @@ class LiveOverlay:
         self.visible = False
 
     def close(self):
-        if self._monitor is not None:
-            NSEvent.removeMonitor_(self._monitor)
-            self._monitor = None
+        if self._tap is not None:
+            Quartz.CGEventTapEnable(self._tap, False)   # คืนคีย์บอร์ดให้ระบบทันที
+            self._tap = None
+        if self._tap_loop is not None:
+            CFRunLoopStop(self._tap_loop)
+            self._tap_loop = None
         self.win.orderOut_(None)
         self.win.close()
 
     def pump(self, seconds=0.001):
-        """ให้ระบบประมวลผลอีเวนต์ (จำเป็น ไม่งั้นหน้าต่างและปุ่มลัดไม่ทำงาน)"""
-        NSRunLoop.currentRunLoop().runUntilDate_(
-            NSDate.dateWithTimeIntervalSinceNow_(seconds))
+        """ดึงอีเวนต์จากคิวแล้วส่งต่อ (ต้องทำ ไม่งั้น global key monitor ไม่ถูกเรียก)"""
+        until = NSDate.dateWithTimeIntervalSinceNow_(seconds)
+        while True:
+            ev = self.app.nextEventMatchingMask_untilDate_inMode_dequeue_(
+                _EVENT_MASK_ANY, until, NSDefaultRunLoopMode, True)
+            if ev is None:
+                break
+            self.app.sendEvent_(ev)
+            until = NSDate.distantPast()   # ดึงที่เหลือในคิวโดยไม่ต้องรอ
 
     # ---- ปุ่มลัด ----
-    def _on_key(self, event):
+    def _run_tap(self):
+        """สร้าง event tap แล้ววน run loop ของตัวเอง (thread นี้รับปุ่มได้ทันที
+        ไม่ต้องรอเฟรมประมวลผลภาพเสร็จ คีย์บอร์ดทั้งเครื่องจึงไม่หน่วง)"""
+        with objc.autorelease_pool():
+            tap = Quartz.CGEventTapCreate(
+                Quartz.kCGSessionEventTap,
+                Quartz.kCGHeadInsertEventTap,
+                Quartz.kCGEventTapOptionDefault,          # active : กลืนปุ่มได้
+                Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown),
+                self._tap_cb,
+                None)
+            if tap is None:                               # ยังไม่ได้รับสิทธิ์ Accessibility
+                self._tap_ready.set()
+                return
+
+            src = CFMachPortCreateRunLoopSource(None, tap, 0)
+            self._tap_loop = CFRunLoopGetCurrent()
+            CFRunLoopAddSource(self._tap_loop, src, kCFRunLoopCommonModes)
+            Quartz.CGEventTapEnable(tap, True)
+            self._tap = tap
+            self._tap_ready.set()
+        CFRunLoopRun()
+
+    def _on_tap(self, proxy, etype, event, refcon):
         try:
-            self._keys.append((int(event.keyCode()),
-                               str(event.charactersIgnoringModifiers() or "")))
+            # macOS ปิด tap เองถ้าตอบช้า -> เปิดกลับ
+            if etype in (Quartz.kCGEventTapDisabledByTimeout,
+                         Quartz.kCGEventTapDisabledByUserInput):
+                if self._tap is not None:
+                    Quartz.CGEventTapEnable(self._tap, True)
+                return event
+            if etype != Quartz.kCGEventKeyDown:
+                return event
+
+            # กดพร้อม Cmd / Ctrl / Option -> ไม่ใช่ปุ่มลัด ปล่อยผ่าน (Cmd+Tab, Ctrl+C ฯลฯ)
+            flags = Quartz.CGEventGetFlags(event)
+            if flags & (Quartz.kCGEventFlagMaskCommand
+                        | Quartz.kCGEventFlagMaskControl
+                        | Quartz.kCGEventFlagMaskAlternate):
+                return event
+
+            code = int(Quartz.CGEventGetIntegerValueField(
+                event, Quartz.kCGKeyboardEventKeycode))
+            if code == KEY_ESC:
+                self._keys.append((code, "esc"))
+                return None                               # กลืนปุ่ม
+            ch = KEYCODE_TO_CHAR.get(code)
+            if ch is None:
+                return event                              # ไม่ใช่ปุ่มลัด ส่งต่อให้สไลด์
+            self._keys.append((code, ch))
+            return None                                   # กลืนปุ่ม ไม่ให้ไปพิมพ์ในแอปอื่น
         except Exception:
-            pass
+            return event
 
     def pop_keys(self):
         keys = []
@@ -248,7 +329,16 @@ def run_live(args):
     last_out = None
 
     print("[live] เริ่มทำงาน — กด q หรือ ESC เพื่อออก (หรือ Ctrl+C ใน Terminal)")
-    print("[live] ถ้ากดปุ่มลัดไม่ติด ให้เปิดสิทธิ์ Input Monitoring ให้ Terminal")
+    if ov.keys_ok:
+        print("[live] ปุ่มลัดพร้อมใช้ (ปุ่มลัดจะไม่ถูกพิมพ์ลงแอปอื่น)")
+    else:
+        request = getattr(Quartz, "CGRequestPostEventAccess", None)
+        if request is not None:
+            request()                                     # ให้ macOS เด้งหน้าขอสิทธิ์
+        print("[live] ปุ่มลัดใช้ไม่ได้: ยังไม่ได้รับสิทธิ์ Accessibility")
+        print("       System Settings > Privacy & Security > Accessibility")
+        print("       เปิดสิทธิ์ให้ Terminal / VS Code แล้วปิด-เปิดแอปใหม่ "
+              "(ตอนนี้ออกด้วย Ctrl+C ใน Terminal)")
 
     try:
         while running:
